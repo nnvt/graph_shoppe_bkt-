@@ -1,0 +1,281 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T5]{fontenc}
+\usepackage[vietnamese]{babel}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{url}
+\usepackage{cite}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Tối ưu hóa giao hàng đa tác tử thời gian thực trên bản đồ lưới}
+
+\author{
+\IEEEauthorblockN{Tên thành viên 1, Tên thành viên 2, Tên thành viên 3}
+\IEEEauthorblockA{
+Nhóm: \textit{Điền thông tin nhóm}\\
+Email: \textit{Điền email nhóm}
+}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Báo cáo trình bày lời giải cho bài toán giao hàng đa tác tử thời gian thực trên bản đồ lưới. Một đội shipper hoạt động đồng thời, nhận và giao các đơn hàng sinh online với trọng lượng, độ ưu tiên và deadline khác nhau. Mục tiêu là tối đa hóa net reward, tức reward giao hàng sau khi trừ chi phí di chuyển. Nhóm mô hình hóa bản đồ thành đồ thị lưới và cài đặt bốn hướng giải: Greedy BFS, VRP-OrTools, Ant Colony Optimization (ACO) và MAPD-CBS. Báo cáo so sánh baseline trong thư mục \code{solvers/archive} với các solver cuối trong \code{solvers}. Trên sáu config Phase 1, kết quả cuối đạt: GreedyBFS 4081.92, ACO 5621.15, MAPD-CBS 5708.37 và VRP-OrTools 5794.99. ACO cao hơn GreedyBFS như yêu cầu phần nâng cao, MAPD-CBS xử lý xung đột đa tác tử, và VRP-OrTools đạt kết quả tổng tốt nhất.
+\end{abstract}
+
+\begin{IEEEkeywords}
+multi-agent delivery, online routing, pickup and delivery, greedy BFS, ant colony optimization, conflict-based search, vehicle routing problem
+\end{IEEEkeywords}
+
+\section{Giới thiệu}
+Bài toán yêu cầu điều phối $C$ shipper trên bản đồ lưới $N \times N$ trong $T$ bước thời gian. Ở mỗi timestep, mỗi shipper chọn một hành động di chuyển và một thao tác hàng hóa. Đơn hàng không xuất hiện toàn bộ từ đầu mà được reveal theo thời gian. Trong các giai đoạn surge, tốc độ sinh đơn tăng; tại hotspot, nhiều điểm lấy hàng tập trung trong một vùng nhỏ. Vì vậy solver phải ra quyết định online dựa trên observation hiện tại, không được đọc trực tiếp cấu hình surge/hotspot hoặc thông tin tương lai.
+
+Khó khăn chính không chỉ là tìm đường ngắn nhất. Thuật toán còn phải cân bằng giữa số đơn giao được, giao đúng hạn, ưu tiên đơn có reward cao, tận dụng capacity, tránh shipper tranh cùng một ô và giữ runtime đủ thấp để chạy lại độc lập trong giới hạn chấm.
+
+\section{Yêu cầu chấm điểm}
+Bảng~\ref{tab:rubric} tóm tắt các hạng mục chấm điểm liên quan trực tiếp đến báo cáo và cài đặt.
+
+\begin{table}[t]
+\centering
+\caption{Thang điểm bài tập lớn}
+\label{tab:rubric}
+\begin{tabular}{lrl}
+\toprule
+Hạng mục & Điểm & Mô tả \\
+\midrule
+Greedy BFS & 5 & Cài đặt đúng, chạy đủ config \\
+VRP + OR-Tools & 5 & Cài đặt đúng, chạy đủ config \\
+ACO & 2.5 & Tốt hơn Greedy BFS, có phân tích \\
+MAPD-CBS & 2.5 & Xử lý xung đột đa tác tử \\
+Báo cáo kỹ thuật & 5 & Theo yêu cầu mục 6.1 \\
+Ranking Phase 2 & 10 & Tính theo net reward \\
+Vấn đáp & 20 & Trình bày và trả lời câu hỏi \\
+\midrule
+Tổng & 50 & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Để tối đa hóa điểm báo cáo, các phần sau trình bày đủ nguyên lý, độ phức tạp, mức độ tối ưu, kết quả định lượng theo từng config, trade-off và chiến lược xử lý surge/hotspot. Phần thành viên và phân công hiện để placeholder:
+\begin{itemize}
+    \item Thành viên 1: Greedy BFS, benchmark và phân tích kết quả.
+    \item Thành viên 2: ACO, VRP-OrTools và tối ưu runtime.
+    \item Thành viên 3: MAPD-CBS, báo cáo kỹ thuật và kiểm thử.
+\end{itemize}
+
+\section{Mô hình bài toán}
+\subsection{Bản đồ và trạng thái shipper}
+Bản đồ được mô hình hóa thành đồ thị vô hướng $G=(V,E)$. Mỗi đỉnh $v \in V$ là một ô trống trên lưới; mỗi cạnh $(u,v) \in E$ nối hai ô kề nhau theo bốn hướng. Vật cản không thuộc $V$. Khoảng cách đường đi được tính bằng BFS trên đồ thị này.
+
+Shipper $i$ tại thời điểm $t$ có trạng thái:
+\begin{equation}
+s_i(t) = (x_i(t), y_i(t), bag_i(t), W_i^{max}, K_i),
+\end{equation}
+trong đó $bag_i(t)$ là các đơn đang mang, $W_i^{max}$ là tải trọng tối đa và $K_i$ là số đơn tối đa.
+
+\subsection{Đơn hàng và reward}
+Đơn hàng $g_j$ được biểu diễn bởi:
+\begin{equation}
+g_j = \langle sx_j, sy_j, ex_j, ey_j, et_j, w_j, p_j \rangle.
+\end{equation}
+Trong đó $(sx_j, sy_j)$ là điểm lấy hàng, $(ex_j, ey_j)$ là điểm giao, $et_j$ là deadline, $w_j$ là trọng lượng và $p_j \in \{1,2,3\}$ là mức ưu tiên. Reward tăng theo priority và weight; nếu giao trễ, reward bị giảm theo độ trễ. Shipper cũng chịu chi phí di chuyển, đặc biệt khi đang mang hàng nặng.
+
+\subsection{Hành động và mục tiêu}
+Ở mỗi timestep, mỗi shipper chọn:
+\begin{equation}
+a_i(t)=(move_i(t), cargo\_op_i(t)).
+\end{equation}
+Thứ tự xử lý là di chuyển, sau đó nhặt hàng, sau đó giao hàng. Mục tiêu tối ưu là:
+\begin{equation}
+\max \sum_i \left(\sum_{g_j \in D_i} R_j + \sum_{t=0}^{T-1} rc_i(t)\right),
+\end{equation}
+với $D_i$ là các đơn shipper $i$ giao thành công, $R_j$ là reward đơn hàng và $rc_i(t)$ là chi phí di chuyển.
+
+\section{Các thuật toán}
+\subsection{Greedy BFS}
+\subsubsection{Baseline}
+Baseline trong \code{solvers/archive/greedy\_bfs\_baseline.py} xem bản đồ là đồ thị lưới và dùng BFS để tính đường đi. Với từng shipper theo thứ tự id tăng dần, nếu shipper đang mang đơn thì chọn điểm giao gần nhất; nếu không mang đơn thì chọn điểm lấy gần nhất trong các đơn còn khả thi.
+
+Tiêu chí giao hàng:
+\begin{equation}
+\min(d_{delivery}, deadline, -priority, id).
+\end{equation}
+Tiêu chí nhặt hàng:
+\begin{equation}
+\min(d_{pickup}, -priority, deadline, id).
+\end{equation}
+
+Độ phức tạp mỗi timestep xấp xỉ $O(CM(|V|+|E|))$ nếu mỗi shipper xét $M$ đơn và gọi BFS để tính khoảng cách. Bộ nhớ phụ là $O(|V|)$ cho hàng đợi BFS. Đây là heuristic cục bộ, không đảm bảo tối ưu toàn cục.
+
+\subsubsection{Thuật toán cuối}
+Phiên bản cuối trong \code{solvers/greedy\_bfs.py} vẫn giữ bản chất greedy+BFS nhưng thay nearest-first bằng scoring có xét reward, priority, deadline và chi phí đường đi. Solver ưu tiên giao ngay nếu shipper đứng tại điểm giao hợp lệ, sau đó dùng score để chọn pickup/delivery tốt hơn.
+
+Score pickup có dạng tổng quát:
+\begin{equation}
+\begin{split}
+score =&~ reward\_proxy + priority\_bonus + urgency\\
+&- d_{pickup} - d_{delivery} - lateness\_penalty.
+\end{split}
+\end{equation}
+
+So với baseline, cải tiến chính là tăng throughput: số đơn giao tăng từ 70 lên 234, missed giảm từ 250 xuống 86. Tuy nhiên GreedyBFS final vẫn yếu ở C3 và C6 vì quyết định vẫn mang tính cục bộ, không tối ưu route dài hoặc xung đột nhiều bước.
+
+\subsection{VRP-OrTools}
+\subsubsection{Baseline}
+Baseline trong \code{solvers/archive/vrp\_ortools.py} dùng OR-Tools khi khả dụng để giải biến thể pickup-and-delivery ngắn hạn. Shipper được xem là vehicle; mỗi đơn tạo pickup node và delivery node; mô hình thêm ràng buộc cùng vehicle, pickup trước delivery và giới hạn capacity. Vì môi trường online, solver chỉ đưa một tập candidate order vào model tại mỗi timestep.
+
+Nếu có $n$ node candidate và $C$ vehicle, bài toán VRP/PDP là NP-hard. OR-Tools dùng metaheuristic và time limit nên không đảm bảo tối ưu toàn cục. Bộ nhớ phụ thuộc vào ma trận khoảng cách và mô hình routing, thường là $O(n^2)$ cho distance matrix.
+
+\subsubsection{Thuật toán cuối}
+Phiên bản cuối trong \code{solvers/vrp\_ortools.py} giữ tư duy VRP nhưng không trực tiếp import OR-Tools. Solver dùng route evaluation nhẹ, SSSP BFS cache, stale-order filter, deadline margin, heat-map estimator và repositioning. Cách này phù hợp hơn với bài toán online vì tránh gọi routing solver nặng ở mỗi timestep.
+
+Nếu khoảng cách đã cache, độ phức tạp scoring chủ yếu phụ thuộc vào số candidate và độ dài route ngắn:
+\begin{equation}
+O(MC_{cand}L_r).
+\end{equation}
+Bộ nhớ có thể tăng tới $O(P|V|)$ với $P$ là số vị trí nguồn được cache BFS. Thuật toán là heuristic gần VRP, không tối ưu tuyệt đối, nhưng đạt cân bằng tốt giữa reward và runtime.
+
+\subsection{Ant Colony Optimization}
+\subsubsection{Baseline}
+Baseline trong \code{solvers/archive/aco\_solver\_baseline.py} dùng Ant Colony Optimization để chọn assignment ngắn hạn. Mỗi ant xây một phương án gán order cho shipper; pheromone lưu theo cặp $(shipper\_id, order\_id)$. Xác suất chọn order phụ thuộc pheromone và heuristic score, sau đó pheromone được bay hơi và cập nhật theo lời giải tốt.
+
+Với $I$ iteration, $A$ ant, $C$ shipper và $M$ order candidate, độ phức tạp xấp xỉ $O(IACM \cdot BFS)$. Bộ nhớ gồm pheromone $O(CM)$ và cache khoảng cách nếu có. Baseline vẫn là heuristic, không đảm bảo hội tụ tối ưu trong thời gian ngắn.
+
+\subsubsection{Thuật toán cuối}
+Phiên bản cuối trong \code{solvers/aco\_solver.py} vẫn dùng ant, pheromone và route scoring, nhưng tăng chất lượng quyết định bằng routing ngắn hạn và tái lập kế hoạch online. Solver chấm điểm route theo reward proxy, deadline, priority, khoảng cách và nguy cơ trễ. Sau mỗi timestep chỉ thực hiện bước đầu tiên rồi replan, phù hợp với đơn hàng sinh online.
+
+Kết quả final đạt 5621.15, cao hơn GreedyBFS final 4081.92, thỏa yêu cầu phần ACO. Điểm cải thiện lớn nhất là delivered tăng từ 121 lên 293 và missed giảm từ 199 xuống 27. Trade-off là runtime tăng lên 124.29s do ACO phải mô phỏng nhiều phương án.
+
+\subsection{MAPD-CBS}
+\subsubsection{Baseline}
+Baseline trong \code{solvers/archive/mapd\_cbs\_solver\_baseline.py} tách bài toán thành hai tầng: assignment và path planning. Tầng assignment chọn mục tiêu pickup/delivery cho từng shipper. Tầng CBS lập đường trong không gian-thời gian, phát hiện vertex conflict và edge conflict, rồi thêm constraint để replan.
+
+Nếu horizon là $H$, mỗi lần tìm đường bằng space-time BFS có độ phức tạp $O(H(|V|+|E|))$. Với $R$ lần sửa xung đột, tổng chi phí có thể xấp xỉ $O(RCH(|V|+|E|))$. MAPD-CBS là optimal nếu CBS chạy đầy đủ trên mục tiêu cố định, nhưng trong bài này bị giới hạn horizon và online replan nên là heuristic conflict-aware.
+
+\subsubsection{Thuật toán cuối}
+Phiên bản cuối trong \code{solvers/mapd\_cbs\_solver.py} cải thiện assignment bằng delivery score, pickup score, detour penalty và xử lý delivery khi đi ngang qua điểm giao. CBS vẫn giữ bounded horizon để kiểm soát runtime. Khi có conflict, solver ưu tiên shipper có deadline hoặc target quan trọng hơn.
+
+So với baseline, final tăng net reward từ 5019.66 lên 5708.37, delivered tăng từ 288 lên 295, late giảm từ 60 xuống 35 và on-time rate tăng từ 79.17\% lên 88.14\%. Đây là thuật toán xử lý xung đột đa tác tử rõ nhất trong bốn hướng.
+
+\section{Thiết lập thực nghiệm}
+Thực nghiệm chạy trên \code{test\_config.txt} gồm sáu config Phase 1, seed cố định theo grader. Baseline chỉ lấy từ \code{solvers/archive}; final lấy từ các file hiện tại trong \code{solvers}. Các metric gồm net reward, delivered, missed, late, on-time rate, reward/delivered và runtime.
+
+Runtime trong báo cáo lấy từ lần benchmark mới nhất trên \code{test\_config.txt}. Tại thời điểm chạy có một process \code{test\_config2} nền đang hoạt động, nên runtime có thể nhiễu nhẹ; các metric reward, delivered, missed, late và on-time không bị ảnh hưởng về mặt logic.
+
+\section{Kết quả}
+\subsection{Tổng hợp baseline và final}
+Bảng~\ref{tab:baseline-final} cho thấy kết quả tổng trên 6 config.
+
+\begin{table*}[t]
+\centering
+\caption{So sánh baseline và thuật toán cuối trên 6 config Phase 1}
+\label{tab:baseline-final}
+\begin{tabular}{llrrrrrrr}
+\toprule
+Thuật toán & Phiên bản & Net reward & Delivered & Missed & Late & On-time & Reward/Del. & Runtime \\
+\midrule
+GreedyBFS & Baseline & 1447.98 & 70/320 & 250 & 12 & 82.86\% & 20.69 & 1.47s \\
+GreedyBFS & Final & 4081.92 & 234/320 & 86 & 43 & 81.62\% & 17.44 & 0.76s \\
+ACO & Baseline & 2435.91 & 121/320 & 199 & 20 & 83.47\% & 20.13 & 15.96s \\
+ACO & Final & 5621.15 & 293/320 & 27 & 31 & 89.42\% & 19.18 & 124.29s \\
+MAPD-CBS & Baseline & 5019.66 & 288/320 & 32 & 60 & 79.17\% & 17.43 & 35.04s \\
+MAPD-CBS & Final & 5708.37 & 295/320 & 25 & 35 & 88.14\% & 19.35 & 33.45s \\
+VRP-OrTools & Baseline & 5120.86 & 290/320 & 30 & 54 & 81.38\% & 17.66 & 80.57s \\
+VRP-OrTools & Final & 5794.99 & 296/320 & 24 & 22 & 92.57\% & 19.58 & 1.65s \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Net reward final theo config}
+Bảng~\ref{tab:reward-config} trình bày net reward của bốn thuật toán cuối theo từng config.
+
+\begin{table}[t]
+\centering
+\caption{Net reward final theo từng config}
+\label{tab:reward-config}
+\begin{tabular}{lrrrrrr}
+\toprule
+Solver & C1 & C2 & C3 & C4 & C5 & C6 \\
+\midrule
+GreedyBFS & 264.86 & 425.78 & 217.99 & 881.74 & 1157.31 & 1134.24 \\
+ACO & 246.92 & 489.42 & 887.94 & 1028.49 & 1343.72 & 1624.67 \\
+MAPD-CBS & 260.96 & 465.48 & 914.60 & 1023.87 & 1372.28 & 1671.19 \\
+VRP-OrTools & 264.35 & 465.95 & 888.14 & 1046.49 & 1439.33 & 1690.72 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{On-time rate và runtime theo config}
+Bảng~\ref{tab:ontime-runtime} cho thấy phần trăm đúng hạn và runtime của các thuật toán cuối.
+
+\begin{table*}[t]
+\centering
+\caption{On-time rate/runtime của các thuật toán cuối theo config}
+\label{tab:ontime-runtime}
+\begin{tabular}{lrrrrrr}
+\toprule
+Solver & C1 & C2 & C3 & C4 & C5 & C6 \\
+\midrule
+GreedyBFS on-time & 100.00\% & 91.30\% & 85.71\% & 84.31\% & 75.71\% & 78.57\% \\
+ACO on-time & 100.00\% & 100.00\% & 94.59\% & 92.86\% & 82.67\% & 86.52\% \\
+MAPD-CBS on-time & 100.00\% & 91.67\% & 91.89\% & 91.07\% & 83.78\% & 85.71\% \\
+VRP-OrTools on-time & 100.00\% & 95.83\% & 94.59\% & 94.64\% & 88.00\% & 92.31\% \\
+\midrule
+GreedyBFS runtime & 0.02s & 0.02s & 0.05s & 0.12s & 0.22s & 0.32s \\
+ACO runtime & 0.14s & 1.03s & 3.08s & 5.40s & 27.53s & 87.12s \\
+MAPD-CBS runtime & 0.07s & 0.25s & 0.96s & 5.50s & 10.93s & 15.74s \\
+VRP-OrTools runtime & 0.03s & 0.07s & 0.12s & 0.26s & 0.43s & 0.74s \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Phân tích và trade-off}
+\subsection{Throughput}
+Metric quan trọng nhất trong Phase 1 là throughput, vì missed order làm mất toàn bộ reward tiềm năng. GreedyBFS baseline chỉ giao 70/320 đơn, khiến net reward thấp dù reward/delivered đạt 20.69. ACO final, MAPD-CBS final và VRP-OrTools final đều giao trên 293/320 đơn, do đó reward tổng cao hơn rõ rệt.
+
+\subsection{Deadline awareness}
+VRP-OrTools final có late thấp nhất, chỉ 22 đơn, và on-time rate cao nhất 92.57\%. MAPD-CBS final giảm late từ 60 xuống 35 so với baseline nhờ ưu tiên deadline trong assignment và conflict handling. ACO final có on-time rate 89.42\%, tốt hơn baseline 83.47\%, nhưng runtime tăng mạnh.
+
+\subsection{Runtime}
+GreedyBFS chạy nhanh nhất vì chỉ dùng heuristic và BFS cục bộ. VRP-OrTools final đạt runtime thấp dù reward cao nhờ thay mô hình OR-Tools lặp bằng route evaluation nhẹ và cache BFS. ACO final là chậm nhất do phải mô phỏng nhiều ant và iteration, nhưng vẫn nằm dưới giới hạn 60 phút.
+
+\subsection{Mức độ tối ưu}
+GreedyBFS là heuristic cục bộ, không có đảm bảo tối ưu. ACO là metaheuristic, có khả năng khám phá nhiều phương án hơn Greedy nhưng phụ thuộc tham số ant/iteration/pheromone. MAPD-CBS có nền tảng tối ưu cho MAPF nếu chạy đầy đủ trên mục tiêu cố định, nhưng trong bài toán online và bounded horizon nên trở thành heuristic conflict-aware. VRP-OrTools baseline dùng solver tối ưu/metaheuristic cho bài toán con, còn final là heuristic VRP-style để đổi lấy tốc độ.
+
+\section{Chiến lược surge và hotspot}
+Solver không đọc trực tiếp thông tin surge/hotspot. Các thuật toán phản ứng gián tiếp qua observation:
+\begin{itemize}
+    \item GreedyBFS và ACO ưu tiên các đơn gần shipper và cụm pickup khả thi, giúp giảm thời gian rỗng khi backlog tăng.
+    \item MAPD-CBS giảm tranh chấp trong khu vực đông shipper bằng conflict-aware planning.
+    \item VRP-OrTools final dùng heat-map/density estimator và repositioning để giữ shipper gần vùng có mật độ đơn cao.
+\end{itemize}
+
+Trong surge, backlog tăng nhanh. Vì vậy cải tiến hiệu quả nhất không phải tối ưu từng đơn riêng lẻ mà là tăng throughput, giảm missed, gom tuyến gần nhau và tránh kéo shipper quá xa khỏi vùng có đơn dày.
+
+\section{Kết luận}
+Báo cáo đã mô hình hóa bài toán giao hàng đa tác tử online trên đồ thị lưới và so sánh bốn nhóm thuật toán theo đúng yêu cầu Phase 1. Kết quả cho thấy baseline nearest-first hoặc assignment ngắn hạn bị giới hạn bởi missed order và deadline handling. Các cải tiến dựa trên reward-aware scoring, route evaluation, CBS conflict handling và heat-map repositioning giúp tăng đáng kể net reward.
+
+Trên \code{test\_config.txt}, thứ hạng final là VRP-OrTools 5794.99, MAPD-CBS 5708.37, ACO 5621.15 và GreedyBFS 4081.92. ACO cao hơn GreedyBFS, thỏa yêu cầu nâng cao. MAPD-CBS xử lý xung đột đa tác tử rõ ràng. VRP-OrTools final đạt kết quả tốt nhất nhờ cân bằng tốt giữa throughput, deadline và runtime.
+
+\begin{thebibliography}{00}
+\bibitem{dorigo}
+M. Dorigo and T. Stutzle, \textit{Ant Colony Optimization}. MIT Press, 2004.
+
+\bibitem{cbs}
+G. Sharon, R. Stern, A. Felner, and N. R. Sturtevant, ``Conflict-based search for optimal multi-agent pathfinding,'' \textit{Artificial Intelligence}, vol. 219, pp. 40--66, 2015.
+
+\bibitem{ortools}
+Google, ``OR-Tools: Operations Research Tools,'' Available: \url{https://developers.google.com/optimization}.
+
+\bibitem{vrp}
+P. Toth and D. Vigo, \textit{Vehicle Routing: Problems, Methods, and Applications}. SIAM, 2014.
+\end{thebibliography}
+
+\end{document}
